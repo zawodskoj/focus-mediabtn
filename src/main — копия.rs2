@@ -1,0 +1,160 @@
+#![no_main]
+#![cfg_attr(not(test), no_std)]
+
+#[cfg(feature = "semihosting")]
+#[macro_use]
+extern crate cortex_m_semihosting;
+
+use core::panic::PanicInfo;
+use hal::prelude::*;
+use stm32f1xx_hal as hal;
+use bxcan::{filter::Mask32, ExtendedId, Frame, Interrupts, StandardId, Rx0, Tx};
+use rtt_target::rprintln;
+
+#[rtic::app(device = stm32f1xx_hal::pac)]
+mod app {
+    use bxcan::Fifo;
+    use rtic::Mutex;
+    use rtt_target::{rprintln, rtt_init_print};
+    use stm32f1xx_hal::can::Can;
+    use super::*;
+
+    #[shared]
+    struct Shared { }
+
+    #[local]
+    struct Local {
+        can_tx: Tx<Can<stm32f1xx_hal::device::CAN1>>,
+        can_rx: Rx0<Can<stm32f1xx_hal::device::CAN1>>
+    }
+
+    #[init]
+    fn init(ctx: init::Context) -> (Shared, Local, init::Monotonics) {
+        let dp = ctx.device;
+
+        let mut flash = dp.FLASH.constrain();
+        let rcc = dp.RCC.constrain();
+
+        let _clocks = rcc
+            .cfgr
+            .use_hse(8.MHz())
+            .sysclk(64.MHz())
+            .hclk(64.MHz())
+            .pclk1(16.MHz())
+            .pclk2(64.MHz())
+            .freeze(&mut flash.acr);
+
+        #[cfg(not(feature = "connectivity"))]
+            let can = Can::new(dp.CAN1, dp.USB);
+
+        #[cfg(feature = "connectivity")]
+            let can = Can::new(cx.device.CAN1);
+
+        // Select pins for CAN1.
+        let mut gpioa = dp.GPIOA.split();
+        let can_rx_pin = gpioa.pa11.into_floating_input(&mut gpioa.crh);
+        let can_tx_pin = gpioa.pa12.into_alternate_push_pull(&mut gpioa.crh);
+        let mut afio = dp.AFIO.constrain();
+        can.assign_pins((can_tx_pin, can_rx_pin), &mut afio.mapr);
+
+        // APB1 (PCLK1): 16MHz, Bit rate: 1000kBit/s, Sample Point 87.5%
+        // Value was calculated with http://www.bittiming.can-wiki.info/
+        let mut can = bxcan::Can::builder(can)
+            .set_bit_timing(0x001c_0000)
+            .leave_disabled();
+
+        can.modify_filters()
+            .enable_bank(0, Fifo::Fifo0, Mask32::accept_all());
+
+        can.enable_interrupts(
+            Interrupts::TRANSMIT_MAILBOX_EMPTY | Interrupts::FIFO0_MESSAGE_PENDING,
+        );
+
+        nb::block!(can.enable_non_blocking()).unwrap();
+
+        let (can_tx, can_rx, _) = can.split();
+
+        (
+            Shared {
+            },
+            Local {
+                can_tx,
+                can_rx
+            },
+            init::Monotonics(),
+        )
+    }
+
+    #[idle(shared = [], local = [])]
+    fn idle(mut ctx: idle::Context) -> ! {
+        rtt_init_print!();
+
+        rprintln!("In loop");
+        rtic::pend(stm32f1xx_hal::pac::Interrupt::USB_HP_CAN_TX);
+
+
+        loop {
+            cortex_m::asm::nop()
+            // let frame = Frame::new_data(StandardId::new(3).unwrap(), []);
+            //
+            // loop {
+            //     match ctx.local.can_tx.transmit(&frame) {
+            //         Ok(_) => {
+            //             rprintln!("transmit ok");
+            //             ctx.local.can_tx.clear_interrupt_flags();
+            //         }
+            //         Err(nb::Error::WouldBlock) => {
+            //             rprintln!("wouldblock")
+            //         }
+            //         Err(e) => {
+            //             rprintln!("err")
+            //         }
+            //     }
+            // }
+        }
+    }
+
+    // This ISR is triggered by each finished frame transmission.
+    #[task(binds = USB_HP_CAN_TX, local = [can_tx], shared = [])]
+    fn can_tx(cx: can_tx::Context) {
+        let tx = cx.local.can_tx;
+
+        tx.clear_interrupt_flags();
+
+        rprintln!("can_tx isr");
+
+        loop {
+            let frame = Frame::new_data(StandardId::new(3).unwrap(), []);
+            match tx.transmit(&frame) {
+                Ok(status) => { rprintln!("transmitted data"); },
+                Err(nb::Error::WouldBlock) => { rprintln!("wouldblock"); break; },
+                Err(_) => { rprintln!("unknown error"); unreachable!() },
+            }
+        }
+    }
+
+    #[task(binds = USB_LP_CAN_RX0, local = [can_rx], shared = [])]
+    fn can_rx0(mut cx: can_rx0::Context) {
+        rprintln!("can_tx isr");
+
+        // Echo back received packages with correct priority ordering.
+        loop {
+            match cx.local.can_rx.receive() {
+                Ok(frame) => {
+                    rprintln!("Rcvd frame")
+                }
+                Err(nb::Error::WouldBlock) => break,
+                Err(nb::Error::Other(_)) => {} // Ignore overrun errors.
+            }
+        }
+    }
+}
+
+#[inline(never)]
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    rprintln!("{}", info);
+    loop {
+        cortex_m::asm::nop()
+    } // You might need a compiler fence in here.
+}
